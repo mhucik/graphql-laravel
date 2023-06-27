@@ -131,35 +131,79 @@ abstract class Field
 
     protected function getResolver(): ?Closure
     {
-        $resolver = $this->originalResolver();
-
-        if (! $resolver) {
+        if (! method_exists($this, 'resolve')) {
             return null;
         }
 
-        return function ($root, ...$arguments) use ($resolver) {
-            $middleware = $this->getMiddleware();
+        $resolver = [$this, 'resolve'];
+        $authorize = [$this, 'authorize'];
 
-            return app()->make(Pipeline::class)
-                ->send(array_merge([$this], $arguments))
-                ->through($middleware)
-                ->via('resolve')
-                ->then(function ($arguments) use ($middleware, $resolver, $root) {
-                    $result = $resolver($root, ...array_slice($arguments, 1));
+        return function () use ($resolver, $authorize) {
+            // 0 - the "root" object; `null` for queries, otherwise the parent of a type
+            // 1 - the provided `args` of the query or type (if applicable), empty array otherwise
+            // 2 - the "GraphQL query context" (see \Rebing\GraphQL\GraphQLController::queryContext)
+            // 3 - \GraphQL\Type\Definition\ResolveInfo as provided by the underlying GraphQL PHP library
+            // 4 (!) - added by this library, encapsulates creating a `SelectFields` instance
+            $arguments = func_get_args();
 
-                    foreach ($middleware as $name) {
-                        /** @var Middleware $instance */
-                        $instance = app()->make($name);
+            // Validate mutation arguments
+            $args = $arguments[1];
 
-                        if (method_exists($instance, 'terminate')) {
-                            app()->terminating(function () use ($arguments, $instance, $result) {
-                                $instance->terminate($this, ...array_slice($arguments, 1), ...[$result]);
-                            });
-                        }
-                    }
+            $rules = $this->getRules($args);
 
-                    return $result;
-                });
+            if (count($rules)) {
+                $validator = $this->getValidator($args, $rules);
+                if ($validator->fails()) {
+                    throw new ValidationError('validation', $validator);
+                }
+            }
+
+            $fieldsAndArguments = (new ResolveInfoFieldsAndArguments($arguments[3]))->getFieldsAndArgumentsSelection($this->depth);
+
+            // Validate arguments in fields
+            $this->validateFieldArguments($fieldsAndArguments);
+
+            $arguments[1] = $this->getArgs($arguments);
+
+            // Authorize
+            if (true != call_user_func_array($authorize, $arguments)) {
+                throw new AuthorizationError($this->getAuthorizationMessage());
+            }
+
+            $method = new ReflectionMethod($this, 'resolve');
+
+            $additionalParams = array_slice($method->getParameters(), 3);
+
+            $additionalArguments = array_map(function ($param) use ($arguments, $fieldsAndArguments) {
+                $paramType = $param->getType();
+
+                if ($paramType->isBuiltin()) {
+                    throw new InvalidArgumentException("'{$param->name}' could not be injected");
+                }
+
+                $className = $param->getType()->getName();
+
+                if (Closure::class === $className) {
+                    return function (int $depth = null) use ($arguments, $fieldsAndArguments): SelectFields {
+                        return $this->instanciateSelectFields($arguments, $fieldsAndArguments, $depth);
+                    };
+                }
+
+                if (SelectFields::class === $className) {
+                    return $this->instanciateSelectFields($arguments, $fieldsAndArguments, null);
+                }
+
+                if (ResolveInfo::class === $className) {
+                    return $arguments[3];
+                }
+
+                return app()->make($className);
+            }, $additionalParams);
+
+            return call_user_func_array($resolver, array_merge(
+                [$arguments[0], $arguments[1], $arguments[2]],
+                $additionalArguments
+            ));
         };
     }
 
